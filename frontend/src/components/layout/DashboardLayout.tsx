@@ -22,6 +22,8 @@ import {
     Settings,
     Share2,
     Wallet,
+    Calendar,
+    Clock,
 } from 'lucide-react';
 
 interface DashboardLayoutProps {
@@ -67,17 +69,22 @@ export function DashboardLayout({ children, role }: DashboardLayoutProps) {
             { name: 'Dashboard', href: '/admin/dashboard', icon: LayoutDashboard },
             { name: 'Doctors', href: '/admin/doctors', icon: Stethoscope },
             { name: 'Patients', href: '/admin/patients', icon: Users },
+            { name: 'Appointments', href: '/admin/appointments', icon: Calendar },
             { name: 'Audit Logs', href: '/admin/audit-logs', icon: ScrollText },
         ],
         doctor: [
             { name: 'Dashboard', href: '/doctor/dashboard', icon: LayoutDashboard },
+            { name: 'Appointments', href: '/doctor/appointments', icon: Calendar },
+            { name: 'Availability', href: '/doctor/availability', icon: Clock },
             { name: 'My Patients', href: '/doctor/patients', icon: UserCheck },
-            { name: 'Medical Records', href: '/doctor/records', icon: FileText },
+
             { name: 'Shared Records', href: '/doctor/shared-records', icon: Wallet },
         ],
         patient: [
             { name: 'Dashboard', href: '/patient/dashboard', icon: LayoutDashboard },
-            { name: 'Medical Records', href: '/patient/records', icon: FileText },
+            { name: 'Book Appointment', href: '/patient/doctors', icon: Stethoscope },
+            { name: 'My Appointments', href: '/patient/appointments', icon: Calendar },
+
             { name: 'Share My Records', href: '/patient/shared-records', icon: Share2 },
             { name: 'Consent Management', href: '/patient/consent', icon: ClipboardList },
             { name: 'Access Logs', href: '/patient/access-logs', icon: Eye },

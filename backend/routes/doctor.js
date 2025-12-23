@@ -6,6 +6,8 @@ const { v4: uuidv4 } = require('uuid');
 const User = require('../models/User');
 const MedicalRecord = require('../models/MedicalRecord');
 const Consent = require('../models/Consent');
+const DoctorAvailability = require('../models/DoctorAvailability');
+const Appointment = require('../models/Appointment');
 const { protect } = require('../middleware/auth');
 const { isDoctor, hasConsent } = require('../middleware/roleCheck');
 const { generateHashFromBuffer, generateRecordId } = require('../services/hashService');
@@ -684,5 +686,349 @@ router.get('/shared-records/:recordId/info', async (req, res) => {
     }
 });
 
-module.exports = router;
+// ========================================
+// AVAILABILITY MANAGEMENT ROUTES
+// ========================================
 
+// @route   POST /api/doctor/availability
+// @desc    Add availability slot
+// @access  Doctor
+router.post('/availability', async (req, res) => {
+    try {
+        const { dayOfWeek, startTime, endTime, slotDuration, date } = req.body;
+
+        // Validate required fields
+        // If date is provided, dayOfWeek is derived. If no date, dayOfWeek is required.
+        let derivedDayOfWeek = dayOfWeek;
+        let formattedDate = null;
+
+        if (date) {
+            const d = new Date(date);
+            if (isNaN(d.getTime())) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid date format'
+                });
+            }
+            d.setUTCHours(0, 0, 0, 0); // Normalize to UTC midnight
+            derivedDayOfWeek = d.getUTCDay();
+            formattedDate = d;
+        }
+
+        if (derivedDayOfWeek === undefined || !startTime || !endTime) {
+            return res.status(400).json({
+                success: false,
+                message: 'dayOfWeek (or date), startTime, and endTime are required'
+            });
+        }
+
+        // Check for overlapping slots
+        // If specific date, check overlap with other slots on that date
+        // If recurring (no date), check overlap with other recurring slots
+        const query = {
+            doctorId: req.user._id,
+            dayOfWeek: derivedDayOfWeek,
+            isActive: true,
+            $or: [
+                { startTime: { $lte: startTime }, endTime: { $gt: startTime } },
+                { startTime: { $lt: endTime }, endTime: { $gte: endTime } },
+                { startTime: { $gte: startTime }, endTime: { $lte: endTime } }
+            ]
+        };
+
+        if (formattedDate) {
+            query.date = formattedDate;
+        } else {
+            query.date = null; // Only check conflicts with recurring slots
+        }
+
+        const existing = await DoctorAvailability.findOne(query);
+
+        if (existing) {
+            return res.status(400).json({
+                success: false,
+                message: 'This time slot overlaps with an existing availability'
+            });
+        }
+
+        const availability = new DoctorAvailability({
+            doctorId: req.user._id,
+            dayOfWeek: derivedDayOfWeek,
+            date: formattedDate,
+            startTime,
+            endTime,
+            slotDuration: slotDuration || 30
+        });
+
+        await availability.save();
+
+        res.status(201).json({
+            success: true,
+            message: 'Availability added successfully',
+            availability
+        });
+    } catch (error) {
+        console.error('Add availability error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to add availability',
+            error: error.message
+        });
+    }
+});
+
+// @route   GET /api/doctor/availability
+// @desc    Get my availability
+// @access  Doctor
+router.get('/availability', async (req, res) => {
+    try {
+        const availability = await DoctorAvailability.getDoctorAvailability(req.user._id);
+
+        res.json({
+            success: true,
+            availability
+        });
+    } catch (error) {
+        console.error('Get availability error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get availability',
+            error: error.message
+        });
+    }
+});
+
+// @route   DELETE /api/doctor/availability/:id
+// @desc    Remove availability slot
+// @access  Doctor
+router.delete('/availability/:id', async (req, res) => {
+    try {
+        const availability = await DoctorAvailability.findOneAndDelete({
+            _id: req.params.id,
+            doctorId: req.user._id
+        });
+
+        if (!availability) {
+            return res.status(404).json({
+                success: false,
+                message: 'Availability slot not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Availability removed successfully'
+        });
+    } catch (error) {
+        console.error('Delete availability error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to delete availability',
+            error: error.message
+        });
+    }
+});
+
+// ========================================
+// APPOINTMENT MANAGEMENT ROUTES
+// ========================================
+
+// @route   GET /api/doctor/appointments
+// @desc    Get appointment requests
+// @access  Doctor
+router.get('/appointments', async (req, res) => {
+    try {
+        const { status, page = 1, limit = 20 } = req.query;
+
+        const query = { doctorId: req.user._id };
+        if (status) query.status = status;
+
+        const appointments = await Appointment.find(query)
+            .populate('patientId', 'profile.firstName profile.lastName email profile.phone profile.dateOfBirth')
+            .sort({ date: -1, startTime: -1 })
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit));
+
+        const total = await Appointment.countDocuments(query);
+
+        // Count by status
+        const statusCounts = await Appointment.aggregate([
+            { $match: { doctorId: req.user._id } },
+            { $group: { _id: '$status', count: { $sum: 1 } } }
+        ]);
+
+        res.json({
+            success: true,
+            appointments,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            },
+            statusCounts: statusCounts.reduce((acc, curr) => {
+                acc[curr._id] = curr.count;
+                return acc;
+            }, {})
+        });
+    } catch (error) {
+        console.error('Get appointments error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get appointments',
+            error: error.message
+        });
+    }
+});
+
+// @route   PUT /api/doctor/appointments/:id/approve
+// @desc    Approve appointment with meeting link
+// @access  Doctor
+router.put('/appointments/:id/approve', async (req, res) => {
+    try {
+        const { meetingLink, notes } = req.body;
+
+        if (!meetingLink) {
+            return res.status(400).json({
+                success: false,
+                message: 'Meeting link is required for approval'
+            });
+        }
+
+        const appointment = await Appointment.findOne({
+            _id: req.params.id,
+            doctorId: req.user._id
+        });
+
+        if (!appointment) {
+            return res.status(404).json({
+                success: false,
+                message: 'Appointment not found'
+            });
+        }
+
+        if (appointment.status !== 'pending') {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot approve appointment with status: ${appointment.status}`
+            });
+        }
+
+        appointment.status = 'approved';
+        appointment.meetingLink = meetingLink;
+        appointment.doctorNotes = notes;
+        appointment.approvedAt = new Date();
+
+        await appointment.save();
+        await appointment.populate('patientId', 'profile.firstName profile.lastName email');
+
+        res.json({
+            success: true,
+            message: 'Appointment approved successfully',
+            appointment
+        });
+    } catch (error) {
+        console.error('Approve appointment error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to approve appointment',
+            error: error.message
+        });
+    }
+});
+
+// @route   PUT /api/doctor/appointments/:id/reject
+// @desc    Reject appointment
+// @access  Doctor
+router.put('/appointments/:id/reject', async (req, res) => {
+    try {
+        const { reason } = req.body;
+
+        const appointment = await Appointment.findOne({
+            _id: req.params.id,
+            doctorId: req.user._id
+        });
+
+        if (!appointment) {
+            return res.status(404).json({
+                success: false,
+                message: 'Appointment not found'
+            });
+        }
+
+        if (appointment.status !== 'pending') {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot reject appointment with status: ${appointment.status}`
+            });
+        }
+
+        appointment.status = 'rejected';
+        appointment.rejectionReason = reason || 'No reason provided';
+
+        await appointment.save();
+        await appointment.populate('patientId', 'profile.firstName profile.lastName email');
+
+        res.json({
+            success: true,
+            message: 'Appointment rejected',
+            appointment
+        });
+    } catch (error) {
+        console.error('Reject appointment error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to reject appointment',
+            error: error.message
+        });
+    }
+});
+
+// @route   PUT /api/doctor/appointments/:id/complete
+// @desc    Mark appointment as completed
+// @access  Doctor
+router.put('/appointments/:id/complete', async (req, res) => {
+    try {
+        const { notes } = req.body;
+
+        const appointment = await Appointment.findOne({
+            _id: req.params.id,
+            doctorId: req.user._id
+        });
+
+        if (!appointment) {
+            return res.status(404).json({
+                success: false,
+                message: 'Appointment not found'
+            });
+        }
+
+        if (appointment.status !== 'approved') {
+            return res.status(400).json({
+                success: false,
+                message: 'Only approved appointments can be marked as completed'
+            });
+        }
+
+        appointment.status = 'completed';
+        appointment.completedAt = new Date();
+        if (notes) appointment.doctorNotes = notes;
+
+        await appointment.save();
+
+        res.json({
+            success: true,
+            message: 'Appointment marked as completed',
+            appointment
+        });
+    } catch (error) {
+        console.error('Complete appointment error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to complete appointment',
+            error: error.message
+        });
+    }
+});
+
+module.exports = router;

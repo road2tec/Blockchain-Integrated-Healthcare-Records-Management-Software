@@ -3,6 +3,7 @@ const router = express.Router();
 const User = require('../models/User');
 const Consent = require('../models/Consent');
 const MedicalRecord = require('../models/MedicalRecord');
+const Appointment = require('../models/Appointment');
 const { protect } = require('../middleware/auth');
 const { isAdmin } = require('../middleware/roleCheck');
 const blockchainService = require('../services/blockchainService');
@@ -398,6 +399,49 @@ router.delete('/users/:id', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Failed to delete user',
+            error: error.message
+        });
+    }
+});
+
+
+
+// @route   GET /api/admin/appointments
+// @desc    Get all appointments
+// @access  Admin
+router.get('/appointments', async (req, res) => {
+    try {
+        const { status, page = 1, limit = 20 } = req.query;
+
+        let query = {};
+        if (status) {
+            query.status = status;
+        }
+
+        const appointments = await Appointment.find(query)
+            .populate('patientId', 'profile.firstName profile.lastName email')
+            .populate('doctorId', 'profile.firstName profile.lastName profile.specialization')
+            .sort({ date: -1, startTime: -1 })
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit));
+
+        const total = await Appointment.countDocuments(query);
+
+        res.json({
+            success: true,
+            appointments,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error('Get all appointments error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get appointments',
             error: error.message
         });
     }

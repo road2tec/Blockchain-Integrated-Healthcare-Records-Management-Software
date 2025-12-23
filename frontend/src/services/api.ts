@@ -25,6 +25,24 @@ api.interceptors.request.use(
     }
 );
 
+// Queue to hold requests while refreshing token
+let isRefreshing = false;
+let failedQueue: Array<{
+    resolve: (token: string) => void;
+    reject: (error: any) => void;
+}> = [];
+
+const processQueue = (error: any, token: string | null = null) => {
+    failedQueue.forEach((prom) => {
+        if (error) {
+            prom.reject(error);
+        } else {
+            prom.resolve(token!);
+        }
+    });
+    failedQueue = [];
+};
+
 // Response interceptor for token refresh
 api.interceptors.response.use(
     (response) => response,
@@ -33,7 +51,19 @@ api.interceptors.response.use(
 
         // If 401 and not already retrying
         if (error.response?.status === 401 && !originalRequest._retry) {
+            if (isRefreshing) {
+                return new Promise((resolve, reject) => {
+                    failedQueue.push({ resolve, reject });
+                })
+                    .then((token) => {
+                        originalRequest.headers.Authorization = `Bearer ${token}`;
+                        return api(originalRequest);
+                    })
+                    .catch((err) => Promise.reject(err));
+            }
+
             originalRequest._retry = true;
+            isRefreshing = true;
 
             try {
                 const refreshToken = localStorage.getItem('refreshToken');
@@ -47,15 +77,21 @@ api.interceptors.response.use(
                     localStorage.setItem('accessToken', accessToken);
                     localStorage.setItem('refreshToken', newRefreshToken);
 
+                    api.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
                     originalRequest.headers.Authorization = `Bearer ${accessToken}`;
+
+                    processQueue(null, accessToken);
                     return api(originalRequest);
                 }
             } catch (refreshError) {
+                processQueue(refreshError, null);
                 // Refresh failed, logout user
                 localStorage.removeItem('accessToken');
                 localStorage.removeItem('refreshToken');
                 window.location.href = '/login';
                 return Promise.reject(refreshError);
+            } finally {
+                isRefreshing = false;
             }
         }
 
@@ -119,6 +155,9 @@ export const adminApi = {
     getUser: (id: string) => api.get(`/admin/users/${id}`),
 
     deleteUser: (id: string) => api.delete(`/admin/users/${id}`),
+
+    getAllAppointments: (params?: { status?: string; page?: number; limit?: number }) =>
+        api.get('/admin/appointments', { params }),
 };
 
 // Doctor API
@@ -212,3 +251,45 @@ export const doctorSharedApi = {
         `${API_BASE_URL}/public/shared-records/${recordId}/view?walletAddress=${walletAddress}`,
 };
 
+// Doctor Availability & Appointments API
+export const doctorAppointmentApi = {
+    // Availability
+    addAvailability: (data: { dayOfWeek: number; startTime: string; endTime: string; slotDuration?: number }) =>
+        api.post('/doctor/availability', data),
+
+    getAvailability: () => api.get('/doctor/availability'),
+
+    deleteAvailability: (id: string) => api.delete(`/doctor/availability/${id}`),
+
+    // Appointments
+    getAppointments: (params?: { status?: string; page?: number; limit?: number }) =>
+        api.get('/doctor/appointments', { params }),
+
+    approveAppointment: (id: string, meetingLink: string, notes?: string) =>
+        api.put(`/doctor/appointments/${id}/approve`, { meetingLink, notes }),
+
+    rejectAppointment: (id: string, reason?: string) =>
+        api.put(`/doctor/appointments/${id}/reject`, { reason }),
+
+    completeAppointment: (id: string, notes?: string) =>
+        api.put(`/doctor/appointments/${id}/complete`, { notes }),
+};
+
+// Patient Appointment API
+export const patientAppointmentApi = {
+    // Browse doctors
+    getDoctors: (params?: { specialization?: string; search?: string; page?: number; limit?: number }) =>
+        api.get('/patient/doctors', { params }),
+
+    getDoctorSlots: (doctorId: string, date: string) =>
+        api.get(`/patient/doctors/${doctorId}/slots`, { params: { date } }),
+
+    // Appointments
+    bookAppointment: (data: { doctorId: string; date: string; startTime: string; endTime: string; reason?: string; symptoms?: string }) =>
+        api.post('/patient/appointments', data),
+
+    getAppointments: (params?: { status?: string; page?: number; limit?: number }) =>
+        api.get('/patient/appointments', { params }),
+
+    cancelAppointment: (id: string) => api.delete(`/patient/appointments/${id}`),
+};

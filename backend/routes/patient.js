@@ -6,6 +6,8 @@ const { v4: uuidv4 } = require('uuid');
 const User = require('../models/User');
 const MedicalRecord = require('../models/MedicalRecord');
 const Consent = require('../models/Consent');
+const DoctorAvailability = require('../models/DoctorAvailability');
+const Appointment = require('../models/Appointment');
 const { protect } = require('../middleware/auth');
 const { isPatient } = require('../middleware/roleCheck');
 const { generateHashFromBuffer, verifyFileHash } = require('../services/hashService');
@@ -833,5 +835,332 @@ router.delete('/shared-records/:recordId', async (req, res) => {
     }
 });
 
-module.exports = router;
+// ========================================
+// DOCTOR BROWSING & APPOINTMENT ROUTES
+// ========================================
 
+// @route   GET /api/patient/doctors
+// @desc    Browse available doctors
+// @access  Patient
+router.get('/doctors', async (req, res) => {
+    try {
+        const { specialization, search, page = 1, limit = 10 } = req.query;
+
+        const query = {
+            role: 'doctor',
+            status: 'active'
+        };
+
+        if (specialization) {
+            query['profile.specialization'] = new RegExp(specialization, 'i');
+        }
+
+        if (search) {
+            query.$or = [
+                { 'profile.firstName': new RegExp(search, 'i') },
+                { 'profile.lastName': new RegExp(search, 'i') },
+                { 'profile.specialization': new RegExp(search, 'i') },
+                { 'profile.hospital': new RegExp(search, 'i') }
+            ];
+        }
+
+        const doctors = await User.find(query)
+            .select('profile.firstName profile.lastName profile.specialization profile.hospital profile.bio email ethereumAddress')
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit));
+
+        const total = await User.countDocuments(query);
+
+        // Get availability info for each doctor
+        const doctorsWithAvailability = await Promise.all(
+            doctors.map(async (doctor) => {
+                const availability = await DoctorAvailability.find({
+                    doctorId: doctor._id,
+                    isActive: true
+                }).select('dayOfWeek startTime endTime');
+
+                return {
+                    ...doctor.toObject(),
+                    hasAvailability: availability.length > 0,
+                    availableDays: [...new Set(availability.map(a => a.dayOfWeek))]
+                };
+            })
+        );
+
+        res.json({
+            success: true,
+            doctors: doctorsWithAvailability,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error('Browse doctors error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get doctors',
+            error: error.message
+        });
+    }
+});
+
+// @route   GET /api/patient/doctors/:id/slots
+// @desc    Get doctor's available slots for a date
+// @access  Patient
+router.get('/doctors/:id/slots', async (req, res) => {
+    try {
+        const { date } = req.query;
+        const doctorId = req.params.id;
+
+        if (!date) {
+            return res.status(400).json({
+                success: false,
+                message: 'Date is required (YYYY-MM-DD format)'
+            });
+        }
+
+        // Verify doctor exists and is approved
+        const doctor = await User.findOne({
+            _id: doctorId,
+            role: 'doctor',
+            status: 'active'
+        }).select('profile.firstName profile.lastName profile.specialization');
+
+        if (!doctor) {
+            return res.status(404).json({
+                success: false,
+                message: 'Doctor not found'
+            });
+        }
+
+        // Get the day of week for the requested date
+        // Standardize date to UTC Midnight to match backend storage
+        const queryDate = new Date(date);
+        queryDate.setUTCHours(0, 0, 0, 0);
+        const dayOfWeek = queryDate.getUTCDay();
+
+        const availability = await DoctorAvailability.find({
+            doctorId,
+            isActive: true,
+            $or: [
+                { date: queryDate },
+                { dayOfWeek, date: null }
+            ]
+        });
+
+        if (availability.length === 0) {
+            return res.json({
+                success: true,
+                doctor,
+                date,
+                dayOfWeek,
+                slots: [],
+                message: 'Doctor is not available on this day'
+            });
+        }
+
+        // Generate all possible slots
+        let allSlots = [];
+        for (const avail of availability) {
+            const slots = avail.generateSlots(date);
+            allSlots = allSlots.concat(slots);
+        }
+
+        // Get already booked slots for that date
+        const dateStart = new Date(date);
+        dateStart.setHours(0, 0, 0, 0);
+        const dateEnd = new Date(date);
+        dateEnd.setHours(23, 59, 59, 999);
+
+        const bookedAppointments = await Appointment.find({
+            doctorId,
+            date: { $gte: dateStart, $lte: dateEnd },
+            status: { $in: ['pending', 'approved'] }
+        }).select('startTime endTime');
+
+        const bookedTimes = bookedAppointments.map(a => a.startTime);
+
+        // Mark slots as available or booked
+        const slotsWithAvailability = allSlots.map(slot => ({
+            ...slot,
+            isAvailable: !bookedTimes.includes(slot.startTime)
+        }));
+
+        res.json({
+            success: true,
+            doctor,
+            date,
+            dayOfWeek,
+            slots: slotsWithAvailability
+        });
+    } catch (error) {
+        console.error('Get doctor slots error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get slots',
+            error: error.message
+        });
+    }
+});
+
+// @route   POST /api/patient/appointments
+// @desc    Book an appointment
+// @access  Patient
+router.post('/appointments', async (req, res) => {
+    try {
+        const { doctorId, date, startTime, endTime, reason, symptoms } = req.body;
+
+        // Validate required fields
+        if (!doctorId || !date || !startTime || !endTime) {
+            return res.status(400).json({
+                success: false,
+                message: 'doctorId, date, startTime, and endTime are required'
+            });
+        }
+
+        // Verify doctor exists
+        const doctor = await User.findOne({
+            _id: doctorId,
+            role: 'doctor',
+            status: 'active'
+        });
+
+        if (!doctor) {
+            return res.status(404).json({
+                success: false,
+                message: 'Doctor not found'
+            });
+        }
+
+        // Check if slot is available
+        const isAvailable = await Appointment.isSlotAvailable(doctorId, date, startTime);
+        if (!isAvailable) {
+            return res.status(400).json({
+                success: false,
+                message: 'This time slot is no longer available'
+            });
+        }
+
+        // Create appointment
+        const appointment = new Appointment({
+            patientId: req.user._id,
+            doctorId,
+            date: new Date(date),
+            startTime,
+            endTime,
+            reason,
+            symptoms,
+            status: 'pending'
+        });
+
+        await appointment.save();
+        await appointment.populate('doctorId', 'profile.firstName profile.lastName profile.specialization email');
+
+        res.status(201).json({
+            success: true,
+            message: 'Appointment booked successfully. Waiting for doctor approval.',
+            appointment
+        });
+    } catch (error) {
+        console.error('Book appointment error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to book appointment',
+            error: error.message
+        });
+    }
+});
+
+// @route   GET /api/patient/appointments
+// @desc    Get my appointments
+// @access  Patient
+router.get('/appointments', async (req, res) => {
+    try {
+        const { status, page = 1, limit = 20 } = req.query;
+
+        const query = { patientId: req.user._id };
+        if (status) query.status = status;
+
+        const appointments = await Appointment.find(query)
+            .populate('doctorId', 'profile.firstName profile.lastName profile.specialization profile.hospital email')
+            .sort({ date: -1, startTime: -1 })
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit));
+
+        const total = await Appointment.countDocuments(query);
+
+        // Count by status
+        const statusCounts = await Appointment.aggregate([
+            { $match: { patientId: req.user._id } },
+            { $group: { _id: '$status', count: { $sum: 1 } } }
+        ]);
+
+        res.json({
+            success: true,
+            appointments,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            },
+            statusCounts: statusCounts.reduce((acc, curr) => {
+                acc[curr._id] = curr.count;
+                return acc;
+            }, {})
+        });
+    } catch (error) {
+        console.error('Get appointments error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get appointments',
+            error: error.message
+        });
+    }
+});
+
+// @route   DELETE /api/patient/appointments/:id
+// @desc    Cancel an appointment
+// @access  Patient
+router.delete('/appointments/:id', async (req, res) => {
+    try {
+        const appointment = await Appointment.findOne({
+            _id: req.params.id,
+            patientId: req.user._id
+        });
+
+        if (!appointment) {
+            return res.status(404).json({
+                success: false,
+                message: 'Appointment not found'
+            });
+        }
+
+        if (!['pending', 'approved'].includes(appointment.status)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot cancel this appointment'
+            });
+        }
+
+        appointment.status = 'cancelled';
+        await appointment.save();
+
+        res.json({
+            success: true,
+            message: 'Appointment cancelled successfully'
+        });
+    } catch (error) {
+        console.error('Cancel appointment error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to cancel appointment',
+            error: error.message
+        });
+    }
+});
+
+module.exports = router;

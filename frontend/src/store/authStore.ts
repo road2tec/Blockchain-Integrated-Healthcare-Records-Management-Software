@@ -128,7 +128,9 @@ export const useAuthStore = create<AuthState>()(
 
             checkAuth: async () => {
                 const accessToken = localStorage.getItem('accessToken');
-                if (!accessToken) {
+                const refreshToken = localStorage.getItem('refreshToken');
+
+                if (!accessToken || !refreshToken) {
                     set({ isAuthenticated: false, user: null });
                     return;
                 }
@@ -139,21 +141,26 @@ export const useAuthStore = create<AuthState>()(
                     set({
                         user: response.data.user,
                         accessToken,
-                        refreshToken: localStorage.getItem('refreshToken'),
+                        refreshToken,
                         isAuthenticated: true,
                         isLoading: false,
                     });
-                } catch (error) {
+                } catch (error: any) {
                     console.error('Auth check failed:', error);
-                    localStorage.removeItem('accessToken');
-                    localStorage.removeItem('refreshToken');
-                    set({
-                        user: null,
-                        accessToken: null,
-                        refreshToken: null,
-                        isAuthenticated: false,
-                        isLoading: false,
-                    });
+                    set({ isLoading: false });
+
+                    // Only logout if it's explicitly an auth error (401)
+                    // and the interceptor failed to refresh
+                    if (error.response?.status === 401) {
+                        localStorage.removeItem('accessToken');
+                        localStorage.removeItem('refreshToken');
+                        set({
+                            user: null,
+                            accessToken: null,
+                            refreshToken: null,
+                            isAuthenticated: false,
+                        });
+                    }
                 }
             },
 
